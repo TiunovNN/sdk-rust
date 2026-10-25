@@ -45,6 +45,8 @@ relevant information.
   nondeterminism while retaining compatibility with histories recorded before these checks.
 
 ### Fixed
+* Resource-based tuning now respects CPU quotas on cgroup v1, including parent quotas and cpuset restrictions.
+  CPU and memory usage metrics continue to refresh while all task slots are occupied.
 * Preserve queued queries across workflow eviction so requests for the same run are answered instead of silently dropped.
 * Dev and test server startup now stops waiting at the configured deadline even if a readiness
   request stalls. Timeout messages include the last connection failure when available.

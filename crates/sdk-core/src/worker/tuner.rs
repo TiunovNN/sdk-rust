@@ -1,3 +1,4 @@
+mod cgroup_cpu;
 mod fixed_size;
 mod resource_based;
 
