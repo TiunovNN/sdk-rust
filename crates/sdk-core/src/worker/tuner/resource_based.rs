@@ -1,4 +1,3 @@
-use super::cgroup_cpu::{CgroupCpuSampler, CpuSource};
 use crate::worker::{
     ActivitySlotKind, LocalActivitySlotKind, NexusSlotKind, SlotInfo, SlotInfoTrait, SlotKind,
     SlotKindType, SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext, SlotSupplier,
@@ -7,7 +6,9 @@ use crate::worker::{
 use crossbeam_utils::atomic::AtomicCell;
 use parking_lot::Mutex;
 use std::{
+    fs,
     marker::PhantomData,
+    path::PathBuf,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -147,7 +148,7 @@ pub struct ResourceController<MI = RealSysInfo> {
     sys_info_supplier: Arc<MI>,
     metrics: OnceLock<JoinHandle<()>>,
     pids: Mutex<PidControllers>,
-    last_pid_outputs: Arc<AtomicCell<LastPidOutputs>>,
+    last_metric_vals: Arc<AtomicCell<LastMetricVals>>,
 }
 /// Implements [SlotSupplier] and attempts to maintain certain levels of resource usage when under
 /// load.
@@ -219,9 +220,11 @@ struct MetricInstruments {
     cpu_pid_output: GaugeF64,
 }
 #[derive(Clone, Copy, Default)]
-struct LastPidOutputs {
+struct LastMetricVals {
     mem_output: f64,
     cpu_output: f64,
+    mem_used_percent: f64,
+    cpu_used_percent: f64,
 }
 
 impl PidControllers {
@@ -464,7 +467,7 @@ impl<MI: SystemResourceInfo + Sync + Send> ResourceController<MI> {
             options,
             metrics: OnceLock::new(),
             sys_info_supplier: sys_info,
-            last_pid_outputs: Arc::new(AtomicCell::new(Default::default())),
+            last_metric_vals: Arc::new(AtomicCell::new(Default::default())),
         }
     }
 
@@ -479,33 +482,29 @@ impl<MI: SystemResourceInfo + Sync + Send> ResourceController<MI> {
         let cpu_used_percent = self.sys_info_supplier.used_cpu_percent();
         let mem_output = pids.mem.next_control_output(mem_used_percent).output;
         let cpu_output = pids.cpu.next_control_output(cpu_used_percent).output;
-        self.last_pid_outputs.store(LastPidOutputs {
+        self.last_metric_vals.store(LastMetricVals {
             mem_output,
             cpu_output,
+            mem_used_percent,
+            cpu_used_percent,
         });
         mem_output > self.options.mem_output_threshold
             && cpu_output > self.options.cpu_output_threshold
     }
 
-    fn attach_metrics(&self, metrics: TemporalMeter)
-    where
-        MI: 'static,
-    {
+    fn attach_metrics(&self, metrics: TemporalMeter) {
         // Launch a task to periodically emit metrics
         self.metrics.get_or_init(move || {
             let m = MetricInstruments::new(metrics);
-            let last_outputs = self.last_pid_outputs.clone();
-            let sys_info = self.sys_info_supplier.clone();
+            let last_vals = self.last_metric_vals.clone();
             tokio::task::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(1));
                 loop {
-                    let outputs = last_outputs.load();
-                    m.mem_pid_output.record(outputs.mem_output, &m.attribs);
-                    m.cpu_pid_output.record(outputs.cpu_output, &m.attribs);
-                    m.mem_usage
-                        .record(sys_info.used_mem_percent() * 100., &m.attribs);
-                    m.cpu_usage
-                        .record(sys_info.used_cpu_percent() * 100., &m.attribs);
+                    let lv = last_vals.load();
+                    m.mem_pid_output.record(lv.mem_output, &m.attribs);
+                    m.cpu_pid_output.record(lv.cpu_output, &m.attribs);
+                    m.mem_usage.record(lv.mem_used_percent * 100., &m.attribs);
+                    m.cpu_usage.record(lv.cpu_used_percent * 100., &m.attribs);
                     interval.tick().await;
                 }
             })
@@ -520,8 +519,7 @@ struct RealSysInfoInner {
     total_mem: AtomicU64,
     cur_mem_usage: AtomicU64,
     cur_cpu_usage: AtomicU64,
-    cgroup_cpu: Mutex<CgroupCpuSampler>,
-    logged_cpu_sources: AtomicUsize,
+    cgroup_cpu_info: CGroupCpuInfo<LinuxCgroupCpuFileSystem>,
 }
 
 impl RealSysInfoInner {
@@ -536,27 +534,25 @@ impl RealSysInfoInner {
             // permanently starve slot admission.
             self.cur_mem_usage
                 .store(cgroup_limits.rss, Ordering::Release);
+
+            let cpu = self.cgroup_cpu_info.calc_cpu_percent().unwrap_or_else(|| {
+                // There won't be a cgroup cpu usage if there is no limit applied to the cgroup
+                // or if an error is encountered when reading cpu.stat or cpu.max.
+                // In these cases, fallback to global cpu usage.
+                lock.refresh_cpu_usage();
+                lock.global_cpu_usage() as f64 / 100.
+            });
+            self.cur_cpu_usage.store(cpu.to_bits(), Ordering::Release);
         } else {
             // Always update the total_mem b/c we could transiently fall to host if
             // lock.cgroup_limits() returns None.
             self.total_mem.store(lock.total_memory(), Ordering::Release);
             self.cur_mem_usage
                 .store(lock.used_memory(), Ordering::Release);
-        }
-        let (cpu, source) = self.cgroup_cpu.lock().sample().unwrap_or_else(|| {
+
             lock.refresh_cpu_usage();
-            (lock.global_cpu_usage() as f64 / 100., CpuSource::Host)
-        });
-        self.cur_cpu_usage.store(cpu.to_bits(), Ordering::Release);
-        let source_bit = 1 << source as usize;
-        let logged_sources = self
-            .logged_cpu_sources
-            .fetch_or(source_bit, Ordering::Relaxed);
-        if logged_sources & source_bit == 0 {
-            tracing::info!(
-                cpu_source = source.name(),
-                "Resource tuner CPU usage source"
-            );
+            let cpu = lock.global_cpu_usage() as f64 / 100.;
+            self.cur_cpu_usage.store(cpu.to_bits(), Ordering::Release);
         }
     }
 }
@@ -590,8 +586,7 @@ impl RealSysInfo {
             cur_mem_usage: AtomicU64::new(0),
             cur_cpu_usage: AtomicU64::new(0),
             total_mem: AtomicU64::new(total_mem),
-            cgroup_cpu: Mutex::new(CgroupCpuSampler::new()),
-            logged_cpu_sources: AtomicUsize::new(0),
+            cgroup_cpu_info: CGroupCpuInfo::new(LinuxCgroupCpuFileSystem::default()),
         });
         inner.refresh();
 
@@ -641,50 +636,189 @@ impl Drop for RealSysInfo {
     }
 }
 
+/// Parsed representation of the CPU quota and slice period exposed by the
+/// cgroup `cpu.max` control file.
+#[derive(Debug)]
+struct CGroupCpuLimits {
+    quota: CpuQuota,
+    period: u64,
+}
+
+/// Enumerates whether a cgroup enforces a specific CPU quota or allows
+/// unlimited usage.
+#[derive(Debug)]
+enum CpuQuota {
+    Unlimited,
+    Limited(u64),
+}
+
+trait CGroupCpuFileSystem {
+    fn read_cpu_stat_file(&self) -> Option<String>;
+    fn read_cpu_limit_file(&self) -> Option<String>;
+}
+
+/// Tracks recent cgroup CPU usage statistics while abstracting the backing
+/// filesystem access for ease of testing.
+#[derive(Debug)]
+struct CGroupCpuInfo<T: CGroupCpuFileSystem> {
+    prev_cpu_usage: AtomicU64,
+    last_refresh: AtomicCell<Option<Instant>>,
+    fs: T,
+}
+
+impl<T: CGroupCpuFileSystem> CGroupCpuInfo<T> {
+    /// Creates a new tracker and immediately primes it by reading the current
+    /// CPU usage so future percentage calculations have baseline data.
+    fn new(fs: T) -> Self {
+        let s = Self {
+            last_refresh: AtomicCell::new(None),
+            prev_cpu_usage: AtomicU64::new(0),
+            fs,
+        };
+        s.calc_cpu_percent();
+        s
+    }
+
+    /// Reads the current CPU usage and limits for the cgroup and calculates the usage percentage based on the
+    /// limits and the elapsed time from the last calculation. Returns `None` until enough data has been collected
+    /// to determine a delta or when quotas are unlimited.
+    fn calc_cpu_percent(&self) -> Option<f64> {
+        let usage = self.read_cpu_usage()?;
+        let limits = self.read_cpus_limit()?;
+
+        let previous_usage = self.prev_cpu_usage.swap(usage, Ordering::AcqRel);
+        let now = Instant::now();
+        let last_updated = self.last_refresh.swap(Some(now));
+
+        if previous_usage > 0
+            && let Some(last_updated) = last_updated
+            && let CpuQuota::Limited(quota) = limits.quota
+            && quota > 0
+        {
+            let elapsed_us = (now - last_updated).as_micros() as f64;
+            let usage_delta = usage.saturating_sub(previous_usage) as f64;
+
+            let cpu_percent = usage_delta * limits.period as f64 / (quota as f64 * elapsed_us);
+            Some(cpu_percent)
+        } else {
+            None
+        }
+    }
+
+    /// Reads the usage_usec value from the cpu.stat file as a u64.
+    /// Returns None if the file cannot be read or if the value cannot be parsed into u64.
+    ///
+    /// The cpu.stat file is expected to be a multiline file where each line is `key value`
+    fn read_cpu_usage(&self) -> Option<u64> {
+        let stat = self.fs.read_cpu_stat_file()?;
+        stat.lines().find_map(|line| {
+            let mut parts = line.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some("usage_usec"), Some(value)) => value.parse::<u64>().ok(),
+                _ => None,
+            }
+        })
+    }
+
+    /// Reads the cpu quota and period from the cpu.max file.
+    /// Returns None if the file cannot be read, or the quota/limit cannot be parsed
+    ///
+    /// The cpu.max file is expected to be in the format 'quota period'
+    fn read_cpus_limit(&self) -> Option<CGroupCpuLimits> {
+        let limit_text = self.fs.read_cpu_limit_file()?;
+        let mut parts = limit_text.split_whitespace();
+        let quota_str = parts.next()?;
+        let period_str = parts.next()?;
+
+        let quota = if quota_str == "max" {
+            CpuQuota::Unlimited
+        } else {
+            CpuQuota::Limited(quota_str.parse().ok()?)
+        };
+        let period = period_str.parse().ok()?;
+
+        Some(CGroupCpuLimits { quota, period })
+    }
+}
+
+/// Implementation of the `CGroupCpuFileSystem` that reads directly
+/// from standard cgroup v1 or v2 mounts.
+#[derive(Debug)]
+struct LinuxCgroupCpuFileSystem {
+    base_path: PathBuf,
+}
+
+impl Default for LinuxCgroupCpuFileSystem {
+    fn default() -> Self {
+        Self {
+            base_path: PathBuf::from("/sys/fs/cgroup"),
+        }
+    }
+}
+
+impl LinuxCgroupCpuFileSystem {
+    fn read_v1_file(&self, controller: &str, name: &str) -> Option<String> {
+        [controller, "cpu,cpuacct", "cpuacct,cpu"]
+            .into_iter()
+            .find_map(|mount| fs::read_to_string(self.base_path.join(mount).join(name)).ok())
+    }
+}
+
+impl CGroupCpuFileSystem for LinuxCgroupCpuFileSystem {
+    fn read_cpu_stat_file(&self) -> Option<String> {
+        // A hybrid hierarchy can expose cpu.stat without assigning CPU quotas to v2.
+        if self.base_path.join("cpu.max").is_file() {
+            return fs::read_to_string(self.base_path.join("cpu.stat")).ok();
+        }
+        let usage_ns: u64 = self
+            .read_v1_file("cpuacct", "cpuacct.usage")?
+            .trim()
+            .parse()
+            .ok()?;
+        // Keep the existing sampler in microseconds for both cgroup versions.
+        Some(format!("usage_usec {}", usage_ns / 1_000))
+    }
+
+    fn read_cpu_limit_file(&self) -> Option<String> {
+        if self.base_path.join("cpu.max").is_file() {
+            return fs::read_to_string(self.base_path.join("cpu.max")).ok();
+        }
+        let quota = self.read_v1_file("cpu", "cpu.cfs_quota_us")?;
+        let period = self.read_v1_file("cpu", "cpu.cfs_period_us")?;
+        let quota = if quota.trim() == "-1" {
+            "max"
+        } else {
+            quota.trim()
+        };
+        Some(format!("{} {}", quota, period.trim()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        abstractions::MeteredPermitDealer,
-        telemetry::metrics::{MetricsCallBuffer, MetricsContext},
+        abstractions::MeteredPermitDealer, telemetry::metrics::MetricsContext,
         worker::WorkflowSlotKind,
     };
     use std::{
+        cell::RefCell,
         env,
         hint::black_box,
+        rc::Rc,
         sync::{
             Arc,
             atomic::{AtomicU64, Ordering},
         },
     };
 
-    use temporalio_common::telemetry::{
-        TelemetryOptions,
-        metrics::{
-            CoreMeter,
-            core::{BufferInstrumentRef, MetricCallBufferer, MetricEvent, MetricUpdateVal},
-        },
-        telemetry_init,
-    };
-
-    #[derive(Clone, Debug)]
-    struct MetricName(String);
-    impl BufferInstrumentRef for MetricName {}
-
     struct FakeMIS {
         used: Arc<AtomicU64>,
-        cpu: AtomicU64,
     }
     impl FakeMIS {
         fn new() -> (Arc<Self>, Arc<AtomicU64>) {
             let used = Arc::new(AtomicU64::new(0));
-            (
-                Arc::new(Self {
-                    used: used.clone(),
-                    cpu: AtomicU64::new(0),
-                }),
-                used,
-            )
+            (Arc::new(Self { used: used.clone() }), used)
         }
     }
     impl SystemResourceInfo for FakeMIS {
@@ -697,7 +831,7 @@ mod tests {
         }
 
         fn used_cpu_percent(&self) -> f64 {
-            f64::from_bits(self.cpu.load(Ordering::Acquire))
+            0.0
         }
     }
 
@@ -706,64 +840,6 @@ mod tests {
             .target_mem_usage(0.8)
             .target_cpu_usage(1.0)
             .build()
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn usage_metrics_refresh_without_slot_decisions() {
-        let (info, used) = FakeMIS::new();
-        let controller = ResourceController::new_with_sysinfo(test_options(), info.clone());
-        let buffer = Arc::new(MetricsCallBuffer::<MetricName>::new(100));
-        let telemetry = telemetry_init(
-            TelemetryOptions::builder()
-                .metrics(buffer.clone() as Arc<dyn CoreMeter>)
-                .build(),
-        )
-        .unwrap();
-        controller.attach_metrics(telemetry.get_temporal_metric_meter().unwrap());
-        tokio::task::yield_now().await;
-        for event in buffer.retrieve() {
-            if let MetricEvent::Create {
-                params,
-                populate_into,
-                ..
-            } = event
-            {
-                populate_into
-                    .set(Arc::new(MetricName(params.name.to_string())))
-                    .unwrap();
-            }
-        }
-        used.store(75_000, Ordering::Release);
-        info.cpu.store(0.9f64.to_bits(), Ordering::Release);
-        tokio::time::advance(Duration::from_secs(2)).await;
-        tokio::task::yield_now().await;
-        let values: Vec<_> = buffer
-            .retrieve()
-            .into_iter()
-            .filter_map(|event| {
-                if let MetricEvent::Update {
-                    instrument,
-                    update: MetricUpdateVal::ValueF64(value),
-                    ..
-                } = event
-                {
-                    Some((instrument.get().0.clone(), value))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert!(
-            values
-                .iter()
-                .any(|(name, value)| name.ends_with("resource_slots_mem_usage") && *value == 75.0)
-        );
-        assert!(
-            values
-                .iter()
-                .any(|(name, value)| name.ends_with("resource_slots_cpu_usage") && *value == 90.0)
-        );
-        controller.metrics.get().unwrap().abort();
     }
 
     #[test]
@@ -973,6 +1049,154 @@ mod tests {
         assert!(pd.try_acquire_owned().is_err());
     }
 
+    #[rstest::rstest]
+    #[case("cpu", "cpuacct")]
+    #[case("cpu,cpuacct", "cpu,cpuacct")]
+    #[case("cpuacct,cpu", "cpuacct,cpu")]
+    fn cgroup_cpu_files_support_v1_mounts_and_prefer_v2(
+        #[case] cpu_mount: &str,
+        #[case] cpuacct_mount: &str,
+    ) {
+        let base_path = env::temp_dir().join(format!("temporal-cgroup-{}", uuid::Uuid::new_v4()));
+        let cpu_path = base_path.join(cpu_mount);
+        let cpuacct_path = base_path.join(cpuacct_mount);
+        fs::create_dir_all(&cpu_path).unwrap();
+        fs::create_dir_all(&cpuacct_path).unwrap();
+        fs::write(cpuacct_path.join("cpuacct.usage"), "1234567000\n").unwrap();
+        fs::write(cpu_path.join("cpu.cfs_quota_us"), "50000\n").unwrap();
+        fs::write(cpu_path.join("cpu.cfs_period_us"), "100000\n").unwrap();
+        fs::write(base_path.join("cpu.stat"), "usage_usec 42\n").unwrap();
+        let info = CGroupCpuInfo::new(LinuxCgroupCpuFileSystem {
+            base_path: base_path.clone(),
+        });
+
+        assert_eq!(info.read_cpu_usage(), Some(1_234_567));
+        assert!(matches!(
+            info.read_cpus_limit(),
+            Some(CGroupCpuLimits {
+                quota: CpuQuota::Limited(50_000),
+                period: 100_000,
+            })
+        ));
+        fs::write(cpu_path.join("cpu.cfs_quota_us"), "-1\n").unwrap();
+        assert!(matches!(
+            info.read_cpus_limit().unwrap().quota,
+            CpuQuota::Unlimited
+        ));
+
+        fs::write(base_path.join("cpu.max"), "20000 100000\n").unwrap();
+        assert_eq!(info.read_cpu_usage(), Some(42));
+        assert!(matches!(
+            info.read_cpus_limit(),
+            Some(CGroupCpuLimits {
+                quota: CpuQuota::Limited(20_000),
+                period: 100_000,
+            })
+        ));
+        fs::remove_dir_all(base_path).unwrap();
+    }
+
+    #[derive(Clone)]
+    struct FakeCGroupFS {
+        stat: Rc<RefCell<Option<String>>>,
+        limit: Rc<RefCell<Option<String>>>,
+    }
+
+    impl FakeCGroupFS {
+        fn new(stat: Rc<RefCell<Option<String>>>, limit: Rc<RefCell<Option<String>>>) -> Self {
+            Self { stat, limit }
+        }
+    }
+
+    impl CGroupCpuFileSystem for FakeCGroupFS {
+        fn read_cpu_stat_file(&self) -> Option<String> {
+            self.stat.borrow().clone()
+        }
+
+        fn read_cpu_limit_file(&self) -> Option<String> {
+            self.limit.borrow().clone()
+        }
+    }
+
+    #[test]
+    fn cgroup_quota_respected() {
+        let stat = Rc::new(RefCell::new(Some("usage_usec 500".into())));
+        let limit = Rc::new(RefCell::new(Some("1000 1000".into())));
+        let fake_fs = FakeCGroupFS::new(stat.clone(), limit.clone());
+
+        let cgroup_info = CGroupCpuInfo::new(fake_fs);
+
+        std::thread::sleep(Duration::from_micros(1_000_u64));
+
+        // No additional usage -> percentage should resolve to exactly zero.
+        assert_eq!(Some(0.0), cgroup_info.calc_cpu_percent());
+
+        // Add some usage such that it we should be above 0, but < 1
+        stat.replace(Some("usage_usec 1000".into()));
+        std::thread::sleep(Duration::from_micros(1_000_u64));
+
+        let cpu_percent = cgroup_info
+            .calc_cpu_percent()
+            .expect("expected usage value");
+        assert!(
+            cpu_percent > 0. && cpu_percent < 1.0,
+            "epected cpu usage between (0.0, 1.0)"
+        );
+
+        // Simulate a large usage increase that should saturate the quota.
+        stat.replace(Some("usage_usec 1000000".into()));
+
+        let cpu_percent = cgroup_info
+            .calc_cpu_percent()
+            .expect("expected usage value");
+        assert!(
+            cpu_percent > 1.0,
+            "expected cpu usage greater than 1.0, got {cpu_percent}"
+        );
+    }
+
+    #[test]
+    fn cgroup_unlimited_quota_is_ignored() {
+        let stat = Rc::new(RefCell::new(Some("usage_usec 1000".into())));
+        let limit = Rc::new(RefCell::new(Some("max 1000".into())));
+
+        let cgroup_info = CGroupCpuInfo::new(FakeCGroupFS::new(stat.clone(), limit.clone()));
+
+        std::thread::sleep(Duration::from_micros(1_000_u64));
+
+        // Unlimited quota is treated as disabled regardless of usage.
+        assert!(cgroup_info.calc_cpu_percent().is_none());
+        stat.replace(Some("usage_usec 2000".into()));
+
+        std::thread::sleep(Duration::from_micros(1_000_u64));
+        assert!(cgroup_info.calc_cpu_percent().is_none());
+    }
+
+    #[test]
+    fn cgroup_stat_file_temporarily_unavailable() {
+        let stat = Rc::new(RefCell::new(None));
+        let limit = Rc::new(RefCell::new(Some("1000 1000".into())));
+
+        let cgroup_info = CGroupCpuInfo::new(FakeCGroupFS::new(stat.clone(), limit.clone()));
+
+        std::thread::sleep(Duration::from_micros(1_000_u64));
+
+        assert!(cgroup_info.calc_cpu_percent().is_none());
+
+        // When available, the next call finishes initialization
+        stat.replace(Some("usage_usec 1000".into()));
+        std::thread::sleep(Duration::from_micros(1_000_u64));
+        assert!(cgroup_info.calc_cpu_percent().is_none());
+
+        // A third call properly calculates percentage
+        stat.replace(Some("usage_usec 1500".into()));
+        std::thread::sleep(Duration::from_micros(1_000_u64));
+        let cpu_percent = cgroup_info
+            .calc_cpu_percent()
+            .expect("expected usage value");
+        assert!(cpu_percent > 0., "expected cpu percent > 0");
+    }
+
     #[test]
     fn cgroup_realsysinfo_uses_cgroup_limits_cpu() {
         if env::var("CGROUP_TESTS_ENABLED").is_err() {
@@ -981,14 +1205,36 @@ mod tests {
         }
 
         let sys_info = RealSysInfo::new(RealSysInfo::MIN_REFRESH_INTERVAL);
-        let mut sampler = CgroupCpuSampler::new();
-        if sampler.sample().is_none() {
-            eprintln!("Skipping: no finite CPU quota detected");
+        let cgroup_info = CGroupCpuInfo::new(LinuxCgroupCpuFileSystem::default());
+        let CGroupCpuLimits { quota, period } = cgroup_info
+            .read_cpus_limit()
+            .expect("unable to read cpu quota.");
+
+        let CpuQuota::Limited(limit) = quota else {
+            eprintln!("Skipping: cpu quota reported unlimited");
             return;
-        }
+        };
+
+        // Prime the internal CPU tracker with some activity.
+        let baseline_time = Instant::now();
+        let prev_usage = cgroup_info
+            .read_cpu_usage()
+            .expect("unable to read cpu usage baseline");
+
+        // Consume some CPU so that the next refresh observes a measurable delta.
         burn_cpu(Duration::from_millis(300));
-        let expected_cpu = sampler.sample().expect("unable to sample cgroup CPU").0;
+
         let cpu_usage = sys_info.used_cpu_percent();
+        let measurement_end = Instant::now();
+        let current_usage = cgroup_info
+            .read_cpu_usage()
+            .expect("unable to read cpu usage after refresh");
+
+        let elapsed_us = measurement_end.duration_since(baseline_time).as_micros() as f64;
+        let usage_delta = current_usage.saturating_sub(prev_usage) as f64;
+        assert!(usage_delta > 0.0, "zero cpu usage delta observed");
+
+        let expected_cpu = usage_delta * period as f64 / (limit as f64 * elapsed_us);
         let cpu_diff = (cpu_usage - expected_cpu).abs();
         const CPU_TOLERANCE: f64 = 0.3;
         assert!(
