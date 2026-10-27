@@ -757,40 +757,50 @@ impl Default for LinuxCgroupCpuFileSystem {
 }
 
 impl LinuxCgroupCpuFileSystem {
-    fn read_v1_file(&self, controller: &str, name: &str) -> Option<String> {
-        [controller, "cpu,cpuacct", "cpuacct,cpu"]
-            .into_iter()
-            .find_map(|mount| fs::read_to_string(self.base_path.join(mount).join(name)).ok())
+    fn read_cpu_files(&self) -> Option<(String, String)> {
+        // Usage and quota must come from the same hierarchy on hybrid systems.
+        if let (Ok(stat), Ok(limit)) = (
+            fs::read_to_string(self.base_path.join("cpu.stat")),
+            fs::read_to_string(self.base_path.join("cpu.max")),
+        ) {
+            return Some((stat, limit));
+        }
+
+        [
+            ("cpuacct", "cpu"),
+            ("cpu,cpuacct", "cpu,cpuacct"),
+            ("cpuacct,cpu", "cpuacct,cpu"),
+        ]
+        .into_iter()
+        .find_map(|(accounting, cpu)| {
+            let usage =
+                fs::read_to_string(self.base_path.join(accounting).join("cpuacct.usage")).ok()?;
+            let cpu_path = self.base_path.join(cpu);
+            let quota = fs::read_to_string(cpu_path.join("cpu.cfs_quota_us")).ok()?;
+            let period = fs::read_to_string(cpu_path.join("cpu.cfs_period_us")).ok()?;
+
+            // Normalize v1 values to the v2 format used by the existing sampler.
+            let usage_ns: u64 = usage.trim().parse().ok()?;
+            let quota = if quota.trim() == "-1" {
+                "max"
+            } else {
+                quota.trim()
+            };
+            Some((
+                format!("usage_usec {}", usage_ns / 1_000),
+                format!("{} {}", quota, period.trim()),
+            ))
+        })
     }
 }
 
 impl CGroupCpuFileSystem for LinuxCgroupCpuFileSystem {
     fn read_cpu_stat_file(&self) -> Option<String> {
-        // A hybrid hierarchy can expose cpu.stat without assigning CPU quotas to v2.
-        if self.base_path.join("cpu.max").is_file() {
-            return fs::read_to_string(self.base_path.join("cpu.stat")).ok();
-        }
-        let usage_ns: u64 = self
-            .read_v1_file("cpuacct", "cpuacct.usage")?
-            .trim()
-            .parse()
-            .ok()?;
-        // Keep the existing sampler in microseconds for both cgroup versions.
-        Some(format!("usage_usec {}", usage_ns / 1_000))
+        self.read_cpu_files().map(|(stat, _)| stat)
     }
 
     fn read_cpu_limit_file(&self) -> Option<String> {
-        if self.base_path.join("cpu.max").is_file() {
-            return fs::read_to_string(self.base_path.join("cpu.max")).ok();
-        }
-        let quota = self.read_v1_file("cpu", "cpu.cfs_quota_us")?;
-        let period = self.read_v1_file("cpu", "cpu.cfs_period_us")?;
-        let quota = if quota.trim() == "-1" {
-            "max"
-        } else {
-            quota.trim()
-        };
-        Some(format!("{} {}", quota, period.trim()))
+        self.read_cpu_files().map(|(_, limit)| limit)
     }
 }
 
@@ -1092,6 +1102,13 @@ mod tests {
                 quota: CpuQuota::Limited(20_000),
                 period: 100_000,
             })
+        ));
+
+        fs::remove_file(base_path.join("cpu.stat")).unwrap();
+        assert_eq!(info.read_cpu_usage(), Some(1_234_567));
+        assert!(matches!(
+            info.read_cpus_limit().unwrap().quota,
+            CpuQuota::Unlimited
         ));
         fs::remove_dir_all(base_path).unwrap();
     }
